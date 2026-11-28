@@ -3,6 +3,87 @@ import * as Script from '../layout/Script';
 
 const DEFAULT_SCRIPTS = ['DFLT', 'dflt', 'latn'];
 
+// Coverage and class definition tables are immutable once decoded, so their
+// per-glyph answers can be memoized for the life of the font. Long text reuses
+// a handful of coverages across thousands of glyphs, where the linear scans
+// otherwise dominate shaping time.
+const coverageCache = new WeakMap();
+const classDefCache = new WeakMap();
+const lookupCoverageCache = new WeakMap();
+
+// The coverage a subtable matches the current glyph against, i.e. the
+// coverage of its first input position. Null when it has none.
+function subtableCoverage(table) {
+  // Follow extension wrappers (GSUB 7 / GPOS 9) to the real subtable.
+  let guard = 0;
+  while (table && table.extension && guard++ < 8) {
+    table = table.extension;
+  }
+
+  if (!table) {
+    return null;
+  }
+
+  if (table.coverage) {
+    return table.coverage;
+  }
+
+  // GPOS mark attachment matches the current glyph against the mark coverage.
+  if (table.markCoverage) {
+    return table.markCoverage;
+  }
+
+  if (table.mark1Coverage) {
+    return table.mark1Coverage;
+  }
+
+  // Coverage-based context/chaining context (format 3) key the first input
+  // glyph by the first entry of their coverage arrays.
+  if (table.version === 3) {
+    if (table.inputCoverage && table.inputCoverage.length > 0) {
+      return table.inputCoverage[0];
+    }
+
+    if (table.coverages && table.coverages.length > 0) {
+      return table.coverages[0];
+    }
+  }
+
+  return null;
+}
+
+// The glyphs a lookup can start a match on: the union of its subtables'
+// first-input coverage. Returns null when a subtable has no such coverage
+// (e.g. GPOS mark attachments, which are keyed by markCoverage), so those
+// lookups are never skipped.
+function lookupCoverage(lookup) {
+  if (lookupCoverageCache.has(lookup)) {
+    return lookupCoverageCache.get(lookup);
+  }
+
+  let set = new Set();
+  let complete = true;
+  for (let table of lookup.subTables) {
+    let coverage = subtableCoverage(table);
+    if (coverage == null) {
+      complete = false;
+      break;
+    }
+
+    if (coverage.version === 1) {
+      for (let id of coverage.glyphs) set.add(id);
+    } else if (coverage.version === 2) {
+      for (let range of coverage.rangeRecords) {
+        for (let id = range.start; id <= range.end; id++) set.add(id);
+      }
+    }
+  }
+
+  let result = complete ? set : null;
+  lookupCoverageCache.set(lookup, result);
+  return result;
+}
+
 export default class OTProcessor {
   constructor(font, table) {
     this.font = font;
@@ -208,30 +289,80 @@ export default class OTProcessor {
     this.positions = positions;
     this.glyphIterator = new GlyphIterator(glyphs);
 
+    // Substitutions replace glyphs in place, so this id set is rebuilt
+    // whenever one succeeds and any later lookup needs it.
+    let present = null;
+    let presentStale = true;
+
     for (let { feature, lookup } of lookups) {
       this.currentFeature = feature;
 
+      // Glyphs the lookup can possibly match. Everything else would only
+      // fail its coverage test, so skip it without entering the subtables.
+      let coverage = lookupCoverage(lookup);
+      if (coverage !== null) {
+        if (presentStale) {
+          present = new Set();
+          for (let glyph of glyphs) present.add(glyph.id);
+          presentStale = false;
+        }
+
+        let intersects = false;
+        for (let id of coverage) {
+          if (present.has(id)) {
+            intersects = true;
+            break;
+          }
+        }
+
+        if (!intersects) {
+          continue;
+        }
+      }
+
       let direction = this.isReverseLookup(lookup) ? -1 : 1;
       let startIndex = direction === -1 ? glyphs.length - 1 : 0;
+      let flags = lookup.flags.flags;
+      let skipsGlyphs =
+        flags.ignoreBaseGlyphs ||
+        flags.ignoreLigatures ||
+        flags.ignoreMarks ||
+        flags.useMarkFilteringSet ||
+        lookup.flags.markAttachmentType;
 
       this.glyphIterator.reset(
         lookup.flags,
         startIndex,
-        this.getMarkFilteringSet(lookup),
+        skipsGlyphs ? this.getMarkFilteringSet(lookup) : null,
       );
 
-      while (
-        this.glyphIterator.index >= 0 &&
-        this.glyphIterator.index < glyphs.length
-      ) {
-        if (feature in this.glyphIterator.cur.features) {
+      let index = startIndex;
+      while (index >= 0 && index < glyphs.length) {
+        let glyph = glyphs[index];
+        this.glyphIterator.index = index;
+        if (
+          feature in glyph.features &&
+          (coverage === null || coverage.has(glyph.id))
+        ) {
           for (let table of lookup.subTables) {
             if (this.applyLookup(lookup.lookupType, table)) {
+              presentStale = true;
               break;
             }
           }
+
+          // Substitutions may delete or insert glyphs and move the cursor.
+          index = this.glyphIterator.index;
         }
-        this.glyphIterator.move(direction);
+
+        // A lookup without ignoring flags visits every glyph, so walk the
+        // buffer directly instead of going through the iterator's skip logic.
+        if (skipsGlyphs) {
+          this.glyphIterator.move(direction);
+          index = this.glyphIterator.index;
+        } else {
+          index += direction;
+        }
       }
     }
   }
@@ -321,17 +452,45 @@ export default class OTProcessor {
     }
 
     switch (coverage.version) {
-      case 1:
-        return coverage.glyphs.indexOf(glyph);
+      case 1: {
+        let map = coverageCache.get(coverage);
+        if (map == null) {
+          map = new Map();
+          let glyphs = coverage.glyphs;
+          for (let i = 0; i < glyphs.length; i++) {
+            // Match indexOf: the first occurrence wins if a font repeats an id.
+            if (!map.has(glyphs[i])) {
+              map.set(glyphs[i], i);
+            }
+          }
 
-      case 2:
-        for (let range of coverage.rangeRecords) {
-          if (range.start <= glyph && glyph <= range.end) {
+          coverageCache.set(coverage, map);
+        }
+
+        let index = map.get(glyph);
+        return index === undefined ? -1 : index;
+      }
+
+      case 2: {
+        // Ranges are sorted and disjoint, so binary search instead of
+        // scanning them, memoized per coverage table.
+        let ranges = coverage.rangeRecords;
+        let low = 0;
+        let high = ranges.length - 1;
+        while (low <= high) {
+          let mid = (low + high) >>> 1;
+          let range = ranges[mid];
+          if (glyph < range.start) {
+            high = mid - 1;
+          } else if (glyph > range.end) {
+            low = mid + 1;
+          } else {
             return range.startCoverageIndex + glyph - range.start;
           }
         }
 
         break;
+      }
     }
 
     return -1;
@@ -360,11 +519,16 @@ export default class OTProcessor {
   }
 
   sequenceMatches(sequenceIndex, sequence) {
-    return this.match(
-      sequenceIndex,
-      sequence,
-      (component, glyph) => component === glyph.id,
-    );
+    let pos = this.glyphIterator.index;
+    let glyph = this.glyphIterator.increment(sequenceIndex);
+    let idx = 0;
+    while (idx < sequence.length && glyph && sequence[idx] === glyph.id) {
+      idx++;
+      glyph = this.glyphIterator.next();
+    }
+
+    this.glyphIterator.index = pos;
+    return idx === sequence.length;
   }
 
   sequenceMatchIndices(sequenceIndex, sequence) {
@@ -384,11 +548,20 @@ export default class OTProcessor {
   }
 
   coverageSequenceMatches(sequenceIndex, sequence) {
-    return this.match(
-      sequenceIndex,
-      sequence,
-      (coverage, glyph) => this.coverageIndex(coverage, glyph.id) >= 0,
-    );
+    let pos = this.glyphIterator.index;
+    let glyph = this.glyphIterator.increment(sequenceIndex);
+    let idx = 0;
+    while (
+      idx < sequence.length &&
+      glyph &&
+      this.coverageIndex(sequence[idx], glyph.id) >= 0
+    ) {
+      idx++;
+      glyph = this.glyphIterator.next();
+    }
+
+    this.glyphIterator.index = pos;
+    return idx === sequence.length;
   }
 
   getClassID(glyph, classDef) {
@@ -401,25 +574,112 @@ export default class OTProcessor {
 
         break;
 
-      case 2:
+      case 2: {
+        let map = classDefCache.get(classDef);
+        if (map == null) {
+          map = new Map();
+          classDefCache.set(classDef, map);
+        }
+
+        let cls = map.get(glyph);
+        if (cls !== undefined) {
+          return cls;
+        }
+
+        cls = 0;
         for (let range of classDef.classRangeRecord) {
           if (range.start <= glyph && glyph <= range.end) {
-            return range.class;
+            cls = range.class;
+            break;
           }
         }
 
-        break;
+        map.set(glyph, cls);
+        return cls;
+      }
     }
 
     return 0;
   }
 
   classSequenceMatches(sequenceIndex, sequence, classDef) {
-    return this.match(
-      sequenceIndex,
-      sequence,
-      (classID, glyph) => classID === this.getClassID(glyph.id, classDef),
-    );
+    let pos = this.glyphIterator.index;
+    let glyph = this.glyphIterator.increment(sequenceIndex);
+    let idx = 0;
+    while (
+      idx < sequence.length &&
+      glyph &&
+      sequence[idx] === this.getClassID(glyph.id, classDef)
+    ) {
+      idx++;
+      glyph = this.glyphIterator.next();
+    }
+
+    this.glyphIterator.index = pos;
+    return idx === sequence.length;
+  }
+
+  // Backtrack arrays are stored in reverse order per the OpenType spec.
+  // Match them by walking backwards from the current glyph instead of
+  // reversing a copy and walking forwards to the same positions.
+  coverageSequenceMatchesBackwards(sequence) {
+    let pos = this.glyphIterator.index;
+    let idx = 0;
+    let matched = true;
+    this.glyphIterator.index = pos;
+    while (idx < sequence.length) {
+      this.glyphIterator.move(-1);
+      let glyph = this.glyphIterator.cur;
+      if (!glyph || this.coverageIndex(sequence[idx], glyph.id) < 0) {
+        matched = false;
+        break;
+      }
+
+      idx++;
+    }
+
+    this.glyphIterator.index = pos;
+    return matched;
+  }
+
+  sequenceMatchesBackwards(sequence) {
+    let pos = this.glyphIterator.index;
+    let idx = 0;
+    let matched = true;
+    this.glyphIterator.index = pos;
+    while (idx < sequence.length) {
+      this.glyphIterator.move(-1);
+      let glyph = this.glyphIterator.cur;
+      if (!glyph || sequence[idx] !== glyph.id) {
+        matched = false;
+        break;
+      }
+
+      idx++;
+    }
+
+    this.glyphIterator.index = pos;
+    return matched;
+  }
+
+  classSequenceMatchesBackwards(sequence, classDef) {
+    let pos = this.glyphIterator.index;
+    let idx = 0;
+    let matched = true;
+    this.glyphIterator.index = pos;
+    while (idx < sequence.length) {
+      this.glyphIterator.move(-1);
+      let glyph = this.glyphIterator.cur;
+      if (!glyph || sequence[idx] !== this.getClassID(glyph.id, classDef)) {
+        matched = false;
+        break;
+      }
+
+      idx++;
+    }
+
+    this.glyphIterator.index = pos;
+    return matched;
   }
 
   applyContext(table) {
@@ -481,13 +741,8 @@ export default class OTProcessor {
 
         let set = table.chainRuleSets[index];
         for (let rule of set) {
-          // Backtrack is stored in reverse order per OpenType spec, so reverse
-          // it before matching forward from the start position.
           if (
-            this.sequenceMatches(
-              -rule.backtrack.length,
-              [...rule.backtrack].reverse(),
-            ) &&
+            this.sequenceMatchesBackwards(rule.backtrack) &&
             this.sequenceMatches(1, rule.input) &&
             this.sequenceMatches(1 + rule.input.length, rule.lookahead)
           ) {
@@ -512,11 +767,9 @@ export default class OTProcessor {
         }
 
         for (let rule of rules) {
-          // Backtrack is stored in reverse order per OpenType spec.
           if (
-            this.classSequenceMatches(
-              -rule.backtrack.length,
-              [...rule.backtrack].reverse(),
+            this.classSequenceMatchesBackwards(
+              rule.backtrack,
               table.backtrackClassDef,
             ) &&
             this.classSequenceMatches(1, rule.input, table.inputClassDef) &&
@@ -536,12 +789,8 @@ export default class OTProcessor {
         break;
 
       case 3:
-        // Backtrack is stored in reverse order per OpenType spec.
         if (
-          this.coverageSequenceMatches(
-            -table.backtrackGlyphCount,
-            [...table.backtrackCoverage].reverse(),
-          ) &&
+          this.coverageSequenceMatchesBackwards(table.backtrackCoverage) &&
           this.coverageSequenceMatches(0, table.inputCoverage) &&
           this.coverageSequenceMatches(
             table.inputGlyphCount,

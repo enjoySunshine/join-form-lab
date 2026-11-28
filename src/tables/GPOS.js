@@ -207,8 +207,8 @@ let GPOSLookup = new r.VersionedStruct('lookupType', {
     markCoverage: new r.Pointer(r.uint16, Coverage),
     baseCoverage: new r.Pointer(r.uint16, Coverage),
     classCount: r.uint16,
-    markArray: new r.Pointer(r.uint16, MarkArray),
-    baseArray: new r.Pointer(r.uint16, BaseArray),
+    markArray: new r.Pointer(r.uint16, MarkArray, { lazy: true }),
+    baseArray: new r.Pointer(r.uint16, BaseArray, { lazy: true }),
   },
 
   5: {
@@ -217,8 +217,8 @@ let GPOSLookup = new r.VersionedStruct('lookupType', {
     markCoverage: new r.Pointer(r.uint16, Coverage),
     ligatureCoverage: new r.Pointer(r.uint16, Coverage),
     classCount: r.uint16,
-    markArray: new r.Pointer(r.uint16, MarkArray),
-    ligatureArray: new r.Pointer(r.uint16, LigatureArray),
+    markArray: new r.Pointer(r.uint16, MarkArray, { lazy: true }),
+    ligatureArray: new r.Pointer(r.uint16, LigatureArray, { lazy: true }),
   },
 
   6: {
@@ -227,8 +227,8 @@ let GPOSLookup = new r.VersionedStruct('lookupType', {
     mark1Coverage: new r.Pointer(r.uint16, Coverage),
     mark2Coverage: new r.Pointer(r.uint16, Coverage),
     classCount: r.uint16,
-    mark1Array: new r.Pointer(r.uint16, MarkArray),
-    mark2Array: new r.Pointer(r.uint16, BaseArray),
+    mark1Array: new r.Pointer(r.uint16, MarkArray, { lazy: true }),
+    mark2Array: new r.Pointer(r.uint16, BaseArray, { lazy: true }),
   },
 
   7: Context, // Contextual positioning

@@ -10,6 +10,17 @@ export default class GlyphIterator {
     this.markAttachmentType = options.markAttachmentType || 0;
     this.markFilteringSet = markFilteringSet;
     this.index = index;
+
+    // Nothing can be ignored when no ignoring flag is set, so move() can
+    // skip the per-glyph checks entirely.
+    let flags = this.flags;
+    this.skips = !!(
+      flags.ignoreMarks ||
+      flags.ignoreBaseGlyphs ||
+      flags.ignoreLigatures ||
+      flags.useMarkFilteringSet ||
+      this.markAttachmentType
+    );
   }
 
   get cur() {
@@ -35,6 +46,14 @@ export default class GlyphIterator {
 
   move(dir) {
     this.index += dir;
+    if (!this.skips) {
+      if (0 <= this.index && this.index < this.glyphs.length) {
+        return this.glyphs[this.index];
+      }
+
+      return null;
+    }
+
     while (
       0 <= this.index &&
       this.index < this.glyphs.length &&
